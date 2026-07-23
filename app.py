@@ -321,6 +321,36 @@ def compute_max_pain(df):
     return float(strikes[idx])
 
 
+def compute_parity_adjusted_evr(band_df, spot, T, r=RISK_FREE_RATE):
+    """Strike-wise CE/PE Extrinsic-Value ratio, parity-adjusted.
+
+    Raw extrinsic value per strike: ev_c = max(0, call_ltp - intrinsic_c),
+    ev_p = max(0, put_ltp - intrinsic_p). European put-call parity implies
+    EV_c - EV_p = K(1 - e^(-rT)) at fair value purely from the carry on the
+    strike, so the "neutral" RAW ratio sits slightly above 1 for no real
+    reason. Subtracting that carry offset from the call side (ev_c_adj)
+    re-centres the baseline at exactly 1.0, so deviations reflect actual
+    demand pressure rather than parity mechanics:
+      >= 1.2  -> Call buyers / Put sellers dominant (bullish pressure)
+      <  0.7  -> Put buyers / Call sellers dominant (bearish pressure)
+      0.7-1.2 -> neutral / balanced
+    Returns (band_df_with_columns, average_finite_ratio).
+    """
+    if band_df is None or band_df.empty or spot <= 0:
+        return band_df, 1.0
+    b = band_df.copy()
+    b["intr_c"] = np.maximum(0, spot - b["strike"])
+    b["ev_c"] = np.maximum(0, b["call_ltp"] - b["intr_c"])
+    b["intr_p"] = np.maximum(0, b["strike"] - spot)
+    b["ev_p"] = np.maximum(0, b["put_ltp"] - b["intr_p"])
+    carry = b["strike"] * (1 - np.exp(-r * max(T, 1e-6)))
+    b["ev_c_adj"] = np.maximum(0, b["ev_c"] - carry)
+    b["evr_parity_adj"] = (b["ev_c_adj"] / b["ev_p"].replace(0, np.nan)).fillna(1.0)
+    finite = b["evr_parity_adj"].replace([np.inf, -np.inf], np.nan).dropna()
+    evr_avg = float(finite.mean()) if not finite.empty else 1.0
+    return b, evr_avg
+
+
 # ─── Data fetchers (Yahoo Finance) ────────────────────────────────────────────
 @st.cache_data(ttl=55, show_spinner=False)
 def fetch_spot_price(ticker):
@@ -623,6 +653,12 @@ _data_status_banner(source, market_open)
 
 m = compute_metrics(df, spot)
 
+band = df[(df["strike"] >= m["atm"] - 12 * max((df["strike"].diff().median() or 1), 1)) &
+          (df["strike"] <= m["atm"] + 12 * max((df["strike"].diff().median() or 1), 1))]
+if band.empty:
+    band = df
+evr_band, evr_avg = compute_parity_adjusted_evr(band, spot, T)
+
 # session-local snapshot history for momentum / temporal IV rank
 if "snap_history" not in st.session_state:
     st.session_state.snap_history = []
@@ -683,12 +719,15 @@ st.write("")
 
 # ── SECTION 3: KEY PRICE LEVELS ────────────────────────────────────────────────
 st.markdown("#### 📐 Section 3 — Key Price Levels")
-l1, l2, l3, l4, l5 = st.columns(5)
+l1, l2, l3, l4, l5, l6 = st.columns(6)
 with l1: _chip("Call Wall", f"{m['call_wall']:.1f}", "#DC2626")
 with l2: _chip("Put Wall", f"{m['put_wall']:.1f}", "#16A34A")
 with l3: _chip("ATM Strike", f"{m['atm']:.1f}", "#374151")
 with l4: _chip("Spot", f"{spot:,.2f}", "#111827")
 with l5: _chip("IV Rank (Temporal)", f"{temporal_rank:.0f}%" if is_temporal else f"{m['iv_rank']:.0f}%*", "#0891B2")
+with l6:
+    _evr_c = "#16A34A" if evr_avg >= 1.2 else ("#DC2626" if evr_avg < 0.7 else "#38BDF8")
+    _chip("Parity-Adj EVR", f"{evr_avg:.2f}", _evr_c)
 if not is_temporal:
     st.caption("* Cross-sectional smile-position rank shown — temporal rank needs more history (accrues across sessions).")
 
@@ -696,10 +735,6 @@ st.write("")
 
 # ── SECTION 4: STRIKE-WISE CHARTS ─────────────────────────────────────────────
 st.markdown("#### 📊 Section 4 — Strike-wise Structure")
-band = df[(df["strike"] >= m["atm"] - 12 * max((df["strike"].diff().median() or 1), 1)) &
-          (df["strike"] <= m["atm"] + 12 * max((df["strike"].diff().median() or 1), 1))]
-if band.empty:
-    band = df
 
 r1c1, r1c2 = st.columns(2)
 with r1c1:
@@ -730,6 +765,26 @@ with r2c2:
     fig.add_bar(x=band["strike"], y=band["put_gamma"], name="Put Gamma", marker_color="#16A34A")
     fig.update_layout(title="Gamma by Strike", barmode="group", height=340, margin=dict(l=10, r=10, t=40, b=10))
     st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("##### ★ Parity-Adjusted CE/PE Extrinsic-Value Ratio per Strike")
+st.caption(
+    "Put-call parity implies EV_c − EV_p = K(1 − e^(−rT)) at fair value — pure carry on the strike, "
+    "not demand. This subtracts that carry term from the call-side extrinsic value before ratioing, so **1.0 is "
+    "the true neutral baseline**. Green ≥ 1.2 = Call buyers / Put sellers dominant (bullish pressure). "
+    "Red < 0.7 = Put buyers / Call sellers dominant (bearish pressure). Blue 0.7–1.2 = neutral / balanced."
+)
+_evr_colors = ["#16A34A" if v >= 1.2 else ("#DC2626" if v < 0.7 else "#38BDF8") for v in evr_band["evr_parity_adj"]]
+fig = go.Figure(go.Bar(
+    x=evr_band["strike"], y=evr_band["evr_parity_adj"] - 1.0, base=1.0,
+    marker_color=_evr_colors, customdata=evr_band["evr_parity_adj"],
+    hovertemplate="Strike %{x}<br>Parity-Adj CE/PE EV Ratio: %{customdata:.3f}<extra></extra>",
+))
+fig.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color="#6B7280",
+              annotation_text="Neutral baseline = 1.0", annotation_position="bottom right")
+fig.add_vline(x=m["atm"], line_width=1, line_dash="dot", line_color="#374151")
+fig.update_layout(title=f"Baseline = 1.0 · Avg Parity-Adj EVR this refresh = {evr_avg:.3f}",
+                   height=380, margin=dict(l=10, r=10, t=40, b=10), showlegend=False)
+st.plotly_chart(fig, use_container_width=True)
 
 st.write("")
 
